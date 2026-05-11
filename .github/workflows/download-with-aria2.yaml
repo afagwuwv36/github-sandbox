@@ -1,112 +1,207 @@
-name: Download from Commit & Save to Repo
+name: ⬇️ Universal Downloader (YouTube + Files)
+
 on:
-  push:
-    branches:
-      - "**"
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Download links (separate with spaces)'
+        required: true
+        type: string
+      mode:
+        description: 'Packaging mode'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - zip
+      password:
+        description: 'Zip password (optional)'
+        required: false
+        default: ''
+        type: string
+      quality:
+        description: 'YouTube video quality'
+        required: false
+        default: 'best'
+        type: choice
+        options:
+          - 'best'
+          - '1080p'
+          - '720p'
+          - '480p'
+          - '360p'
+          - 'audio only'
+      subs:
+        description: 'Download subtitles (YouTube only)'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+
+env:
+  SPLIT_THRESHOLD_MB: 200
+
 jobs:
-  save-file:
-    if: contains(github.event.head_commit.message, 'download:') || contains(github.event.head_commit.message, 'download-zip:')
+  download:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     permissions:
       contents: write
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-      - name: Install aria2
-        run: sudo apt-get install -y aria2
-
-      - name: Extract URLs and download files
+      - name: Configure Git
         run: |
-          MSG=$(git log -1 --pretty=%B)
-          echo "Commit message: $MSG"
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 100m
+          git config --global pack.threads 1
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          echo "Git configured"
 
-          if echo "$MSG" | grep -qP 'download-zip:'; then
-            MODE="zip"
-            URL_LINE=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
-          elif echo "$MSG" | grep -qP 'download:'; then
-            MODE="normal"
-            URL_LINE=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
-          else
-            echo "❌ No download command found in commit message"
-            exit 1
-          fi
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 zip curl bc ffmpeg python3-pip
+          pip3 install yt-dlp
+          echo "Dependencies installed"
 
-          echo "Mode: $MODE"
-          mkdir -p downloads tmp_downloads
+      - name: Download files
+        run: |
+          set -e
 
-          for URL in $URL_LINE; do
-            FILENAME=$(basename "$URL")
-            echo "⬇️ Downloading $URL -> $FILENAME"
+          MODE="${{ github.event.inputs.mode }}"
+          URLS="${{ github.event.inputs.urls }}"
+          ZIP_PASSWORD="${{ github.event.inputs.password }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          SUBS="${{ github.event.inputs.subs }}"
+          SPLIT_THRESHOLD_MB=${{ env.SPLIT_THRESHOLD_MB }}
+          SPLIT_THRESHOLD_BYTES=$(( SPLIT_THRESHOLD_MB * 1024 * 1024 ))
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+          BACKUP_DIR="/tmp/download_backup_$$"
 
-            aria2c \
-              --split=2 \
-              --max-connection-per-server=2 \
-              --min-split-size=90M \
-              --dir="tmp_downloads" \
-              "$URL"
-          done
+          mkdir -p "$BACKUP_DIR" downloads tmp_downloads
+          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
 
-          if [ "$MODE" = "zip" ]; then
-            ARCHIVE_NAME="tmp_downloads/archive_$(date +%Y%m%d_%H%M%S).zip"
-            zip -j "$ARCHIVE_NAME" tmp_downloads/*
-          fi
+          # ---- Helper functions ----
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
 
-          # Split any file over 90MB using zip native split (unzip compatible)
-          for FILE in tmp_downloads/*; do
-            [ -f "$FILE" ] || continue
-            SIZE=$(stat -c%s "$FILE")
-            LIMIT=$((90 * 1024 * 1024))
-            BASENAME=$(basename "$FILE")
+          # ---- YouTube downloader ----
+          download_youtube() {
+            local URL="$1"
+            local OUTPUT_DIR="tmp_downloads"
 
-            if [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB — splitting with zip..."
-              # zip -s creates: file.zip, file.z01, file.z02, ...
-              zip -0 -s 90m "downloads/${BASENAME}.zip" -j "$FILE"
-              echo "✅ Parts: $(ls downloads/${BASENAME}* | wc -l)"
+            # Resolve Google redirect links
+            if [[ "$URL" == *"google.com"* ]]; then
+              echo "→ Detected Google redirect link, resolving..."
+              URL=$(curl -Ls -o /dev/null -w '%{url_effective}' "$URL")
+              echo "→ Resolved to: $URL"
+            fi
+
+            # Quality selection
+            case "$QUALITY" in
+              "best")       FORMAT_OPT="bestvideo+bestaudio/best" ;;
+              "1080p")      FORMAT_OPT="bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
+              "720p")       FORMAT_OPT="bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
+              "480p")       FORMAT_OPT="bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
+              "360p")       FORMAT_OPT="bestvideo[height<=360]+bestaudio/best[height<=360]" ;;
+              "audio only") FORMAT_OPT="bestaudio/best" ;;
+              *)            echo "Unknown quality, defaulting to best"; FORMAT_OPT="best" ;;
+            esac
+
+            CMD="yt-dlp --format '$FORMAT_OPT' --merge-output-format mp4 --output '$OUTPUT_DIR/%(title)s.%(ext)s'"
+            if [ "$SUBS" = "yes" ]; then
+              CMD="$CMD --write-subs --sub-lang all --embed-subs"
+            fi
+            CMD="$CMD '$URL'"
+            echo "→ Running: $CMD"
+            eval "$CMD" || {
+              echo "⚠️ yt-dlp failed, trying direct download with aria2c..."
+              download_direct "$URL"
+            }
+          }
+
+          # ---- Generic downloader (original logic, enhanced) ----
+          download_direct() {
+            local URL="$1"
+            local FILENAME=$(basename "$URL" | sed 's/%20/ /g' | sed 's/%2F/-/g' | sed 's/[?#].*//')
+            FILENAME=$(echo "$FILENAME" | sed 's/[<>:"|?*]/_/g')
+            echo "→ Downloading $FILENAME"
+
+            rm -f "tmp_downloads/$FILENAME" "tmp_downloads/$FILENAME.aria2"
+            aria2c --split=2 --max-connection-per-server=2 --min-split-size=20M \
+              --max-tries=3 --retry-wait=5 --timeout=60 --connect-timeout=30 \
+              --follow-torrent=false --check-certificate=false --allow-overwrite=true \
+              --auto-file-renaming=false --dir="tmp_downloads" --out="$FILENAME" "$URL" \
+              || curl -L -f -# --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 3600 \
+              -A "Mozilla/5.0" -o "tmp_downloads/$FILENAME" "$URL"
+          }
+
+          # ---- Main loop ----
+          for URL in $URLS; do
+            if [[ "$URL" == *"youtube.com"* ]] || [[ "$URL" == *"youtu.be"* ]] || [[ "$URL" == *"google.com"* ]]; then
+              download_youtube "$URL"
             else
-              cp "$FILE" "downloads/$BASENAME"
+              download_direct "$URL"
             fi
           done
 
-          rm -rf tmp_downloads
-
-      - name: Commit & Push in batches of 5 files
-        run: |
-          BRANCH="${GITHUB_REF_NAME}"
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-
-          # Collect all new/untracked files under downloads/
-          mapfile -t ALL_FILES < <(git ls-files --others --modified --exclude-standard downloads/)
-
-          TOTAL=${#ALL_FILES[@]}
-          echo "📦 Total files to push: $TOTAL"
-
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "Nothing to commit"
-            exit 0
+          # ---- Packaging ----
+          if [ "$MODE" = "zip" ]; then
+            echo "→ Creating zip archives (${SPLIT_THRESHOLD_MB} MB parts)..."
+            ARCHIVE_BASE="$BACKUP_DIR/archive_$(date +%Y%m%d_%H%M%S)"
+            mkdir -p "$ARCHIVE_BASE"
+            if [ -n "$ZIP_PASSWORD" ]; then
+              zip -j -P "${ZIP_PASSWORD}" -s ${SPLIT_THRESHOLD_MB}m "${ARCHIVE_BASE}/archive.zip" tmp_downloads/*
+            else
+              zip -j -s ${SPLIT_THRESHOLD_MB}m "${ARCHIVE_BASE}/archive.zip" tmp_downloads/*
+            fi
+            cp -r "$ARCHIVE_BASE" downloads/
+          else
+            echo "→ Moving files (split if > ${SPLIT_THRESHOLD_MB} MB)..."
+            for f in tmp_downloads/*; do
+              [ -f "$f" ] || continue
+              SIZE=$(stat -c%s "$f")
+              BASENAME=$(basename "$f")
+              FOLDER="$BACKUP_DIR/${BASENAME%.*}"
+              mkdir -p "$FOLDER"
+              if [ "$SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
+                zip -j -s ${SPLIT_THRESHOLD_MB}m "${FOLDER}/${BASENAME%.*}.zip" "$f"
+              else
+                cp "$f" "$FOLDER/"
+              fi
+            done
+            cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
           fi
 
-          BATCH_SIZE=5
-          BATCH_NUM=0
+          rm -rf tmp_downloads
 
-          for (( i=0; i<TOTAL; i+=BATCH_SIZE )); do
-            BATCH_NUM=$(( BATCH_NUM + 1 ))
-            BATCH=("${ALL_FILES[@]:i:BATCH_SIZE}")
+      - name: Push to repository
+        run: |
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+          if [ -d "$BACKUP_DIR" ] && [ "$(ls -A $BACKUP_DIR 2>/dev/null)" ]; then
+            mkdir -p downloads
+            cp -r "$BACKUP_DIR"/* downloads/
+          fi
+          git add downloads/ || true
+          git commit -m "📥 New download(s) [skip ci]" || true
+          git push || true
 
-            echo "🚀 Pushing batch $BATCH_NUM: files $((i+1))–$(( i + ${#BATCH[@]} )) of $TOTAL"
-
-            git add "${BATCH[@]}"
-            git commit -m "Add downloaded files — batch $BATCH_NUM [skip ci]"
-
-            # Pull with rebase before each push to avoid conflicts from prior batches
-            git pull --rebase origin "$BRANCH"
-            git push origin HEAD:"$BRANCH"
-
-            echo "✅ Batch $BATCH_NUM pushed"
-          done
-
-          echo "🎉 All $TOTAL files pushed in $BATCH_NUM batch(es)"
+      - name: Cleanup
+        if: always()
+        run: rm -rf /tmp/backup_dir_path.txt /tmp/download_backup_*
